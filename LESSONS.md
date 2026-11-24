@@ -26,3 +26,11 @@ Date: 2026-11-24. Source: the manifest-system / DiskWarrior R&D session (Oct–N
 11. **One command, one pipeline.** `pipeline.py full` (scan → collect → ingest → report) replaced a chain of manual steps that each had a failure mode. Automate the chain; do not rely on remembering the steps.
 12. **Every drive gets a scan before any deletion.** The "keep" list comes from the manifest, not from memory. No wipe, reformat, or delete happens until the drive is inventoried and the user approves the keep list.
 13. **Stale data is worse than no data.** A database that says a file exists when it does not leads to wasted work and wrong decisions. Re-scan on a schedule (weekly) to keep the ledger current.
+
+## Deletion-batch lessons (2026-11-24)
+
+14. **Purge deleted rows from the DB after every deletion batch.** The DB goes stale and future duplicate queries surface ghosts. Batches 1+2 deleted 25 files (~299 GB); 23 rows had to be purged afterward. WhatsApp `Video.tar` and Chrome `weights.bin` entries were still listed after the files were deleted.
+15. **HuggingFace cache snapshot files are symlinks to blobs — check inodes before counting duplicates.** A snapshot+blob pair is ONE real copy, not two. The ACE-Step model had only 1 real 6.6 GB copy on the Vault; the Studio copies were already offloaded away and the Vault "second" copy was a symlink to the first.
+16. **Never delete from inside a Photos Library (.photoslibrary).** Same-hash files in `Masters/` are library-managed; deleting corrupts the library. `IMG_1765.MOV` (10.7 GB x 2) was left alone.
+17. **Same-hash files on different machines are not duplicates.** Each machine legitimately needs its own copy. `qwen3.8-27b.gguf` (16.8 GB on Pro + Studio) was left alone.
+18. **Temp files clean themselves up — verify existence on the RIGHT machine before presenting a batch.** Apple Configurator `TemporaryItems` were gone from mini32 by the time we checked. The first existence check ran Pro paths for mini32 files and falsely reported them missing.
