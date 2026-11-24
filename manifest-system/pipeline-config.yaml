@@ -1,0 +1,146 @@
+# Manifest Pipeline Configuration
+#
+# Defines every scan target for the manifest pipeline.
+# - "local" targets run on the MacBook Pro (where pipeline.py runs)
+# - "fleet" targets run on remote machines via SSH
+#
+# Source labels must stay stable: they are embedded in manifest entries
+# and used as the DB's per-drive identity. Changing a label orphans
+# the old rows (see `pipeline.py clean`).
+#
+# Updated 2026-11-23: outputs moved from /tmp/ to runs/ (survives reboots).
+# 5TB drive (disk6) now connected: CreytixVault, LaCie, CreytixImages.
+# Seagate 8TB (disk8) now on Pro. Mac HD1/HD2 not mounted — disabled.
+
+settings:
+  # Directory on the Pro where fleet manifests are collected
+  incoming_dir: /Users/ricardo/workspace/manifest-system/incoming
+  # Path to manifest-agent.py (on Pro; fleet machines need their own copy)
+  agent_path: /Users/ricardo/workspace/manifest-system/manifest-agent.py
+  # Path to manifest-db.py (Pro only — the DB lives here)
+  db_path: /Users/ricardo/workspace/manifest-system/manifest-db.py
+  # Log file
+  log_file: /Users/ricardo/workspace/manifest-system/pipeline.log
+  # SSH options for fleet commands
+  ssh_opts: "-o BatchMode=yes -o ConnectTimeout=15"
+
+# --- Local targets (run on the Pro) -----------------------------------------
+local:
+  - name: 2TB-Porsche
+    path: "/Volumes/2 TB Hard Drive"
+    source_label: 2TB-Porsche
+    output: /Users/ricardo/workspace/manifest-system/runs/2tb-porsche.manifest.jsonl
+    enabled: true
+
+  - name: Pro-Users
+    path: /Users/ricardo
+    source_label: Pro-Users
+    output: /Users/ricardo/workspace/manifest-system/runs/mac-users.manifest.jsonl
+    enabled: true
+
+  - name: CreytixVault-5TB
+    path: "/Volumes/CreytixVault"
+    source_label: 5TB-CreytixVault
+    output: /Users/ricardo/workspace/manifest-system/runs/5tb-creytixvault.manifest.jsonl
+    enabled: true
+    note: "5TB drive (disk6) APFS volume, 1.1 TB — the live CreytixVault, NOT the damaged HFS+ LaCie"
+
+  - name: LaCie-5TB
+    path: "/Volumes/LaCie"
+    source_label: 5TB-LaCie
+    output: /Users/ricardo/workspace/manifest-system/runs/5tb-lacie.manifest.jsonl
+    enabled: true
+    note: "5TB drive (disk6) APFS volume, 44.9 GB"
+
+  - name: CreytixImages-5TB
+    path: "/Volumes/CreytixImages"
+    source_label: 5TB-CreytixImages
+    output: /Users/ricardo/workspace/manifest-system/runs/5tb-creytiximages.manifest.jsonl
+    enabled: true
+    note: "5TB drive (disk6) APFS volume, 401.4 GB"
+
+  - name: Seagate-8TB
+    path: "/Volumes/Seagate 8TB"
+    source_label: Seagate-8TB
+    output: /Users/ricardo/workspace/manifest-system/runs/seagate-8tb.manifest.jsonl
+    enabled: true
+    note: "8TB Seagate (disk8), 3.3 TB used — was on mini32, now on Pro"
+
+  - name: Macintosh-HD-1
+    path: "/Volumes/Macintosh HD 1"
+    source_label: Macintosh-HD-1
+    output: /Users/ricardo/workspace/manifest-system/runs/mac-hd1.manifest.jsonl
+    enabled: false
+    note: "Not mounted as of 2026-11-23 — enable when reconnected"
+
+  - name: Macintosh-HD-2
+    path: "/Volumes/Macintosh HD 2"
+    source_label: Macintosh-HD-2
+    output: /Users/ricardo/workspace/manifest-system/runs/mac-hd2.manifest.jsonl
+    enabled: false
+    note: "Not mounted as of 2026-11-23 — enable when reconnected"
+
+# --- Fleet targets (run over SSH) --------------------------------------------
+fleet:
+  - name: mini32-GDRIVE
+    machine: fleet-mini32
+    user: ricardo
+    path: "/Volumes/G-DRIVE Thunderbolt 3"
+    source_label: mini32-GDRIVE
+    remote_output: /Users/ricardo/gdrive-tb3.manifest.jsonl
+    agent_path: /Users/ricardo/workspace/manifest-system/manifest-agent.py
+    enabled: true
+
+  - name: mini32-Storage
+    machine: fleet-mini32
+    user: ricardo
+    path: /Volumes/Storage
+    source_label: mini32-Storage
+    remote_output: /Users/ricardo/storage.manifest.jsonl
+    agent_path: /Users/ricardo/workspace/manifest-system/manifest-agent.py
+    enabled: true
+
+  - name: mini32-Users
+    machine: fleet-mini32
+    user: ricardo
+    path: /Users/ricardo
+    source_label: mini32-Users
+    remote_output: /Users/ricardo/mini32-users.manifest.jsonl
+    agent_path: /Users/ricardo/workspace/manifest-system/manifest-agent.py
+    enabled: true
+
+  - name: air-Users
+    machine: fleet-air
+    user: macadmin
+    path: /Users/macadmin
+    source_label: air-Users
+    remote_output: /Users/macadmin/air-users.manifest.jsonl
+    agent_path: /Users/macadmin/manifest-agent.py
+    enabled: true
+
+  - name: studio-Users
+    machine: fleet-studio
+    user: mac-mini-studio
+    path: /Users/mac-mini-studio
+    source_label: studio-Users
+    remote_output: /Users/mac-mini-studio/studio-users.manifest.jsonl
+    agent_path: /Users/mac-mini-studio/manifest-agent.py
+    enabled: true
+
+  - name: mini8-Users
+    machine: fleet-mini8
+    user: macadmin
+    path: /Users/macadmin
+    source_label: mini8-Users
+    remote_output: /Users/macadmin/mini8-Users.manifest.jsonl
+    agent_path: /Users/macadmin/manifest-agent.py
+    enabled: true
+
+  - name: minitool-Users
+    machine: fleet-minitool
+    user: macadmin
+    path: /Users
+    source_label: minitool-Users
+    remote_output: /Users/macadmin/minitool-users.manifest.jsonl
+    agent_path: /Users/macadmin/manifest-agent.py
+    enabled: true

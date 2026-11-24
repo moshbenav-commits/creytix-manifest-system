@@ -1,0 +1,26 @@
+# Manifests and databases (generated, machine-specific — never commit)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.jsonl
+*.jsonl.gz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs and local state
+*.log
+incoming/
+runs/
+
+# Editor
+.vscode/
+.idea/

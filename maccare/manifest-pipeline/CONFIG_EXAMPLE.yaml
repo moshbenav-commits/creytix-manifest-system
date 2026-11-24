@@ -1,0 +1,58 @@
+# Manifest Pipeline — Example Configuration (MacCare)
+#
+# Copy this file to pipeline-config.yaml (in the same directory as the
+# manifest-pipeline script) and edit the targets for your machine.
+# Or pass any config with:  manifest-pipeline --config my-config.yaml
+#
+# The same structure is accepted as JSON (a file whose content starts
+# with "{"). JSON is the escape hatch if you need YAML features the
+# built-in subset parser does not support (anchors, multi-line scalars).
+#
+# Rules:
+# - Source labels must stay stable: they are embedded in manifest entries
+#   and used as the DB's per-drive identity. Changing a label orphans
+#   the old rows (see `manifest-pipeline clean`).
+# - Relative paths in settings are resolved against this config file's
+#   directory. Absolute paths are used as-is.
+# - Set enabled: false for any drive that is not currently connected.
+
+settings:
+  # Directory where fleet manifests are collected (scp target)
+  incoming_dir: incoming
+  # Path to manifest-agent.py (defaults to the copy next to the script)
+  agent_path: manifest-agent.py
+  # Path to manifest-db.py (defaults to the copy next to the script;
+  # the ledger manifests.db lives next to it)
+  db_path: manifest-db.py
+  # Log file for pipeline runs
+  log_file: pipeline.log
+  # SSH options for fleet commands
+  ssh_opts: "-o BatchMode=yes -o ConnectTimeout=15"
+
+# --- Local targets (run on this machine) ------------------------------------
+local:
+  - name: Example-Drive
+    path: "/Volumes/Example Drive"
+    source_label: Example-Drive
+    output: runs/example-drive.manifest.jsonl
+    enabled: false
+    note: "Example only — point this at a real drive and set enabled: true"
+
+  - name: Home-Documents
+    path: /Users/ricardo/Documents
+    source_label: Home-Documents
+    output: runs/home-documents.manifest.jsonl
+    enabled: false
+    note: "Example only — enable once you have reviewed what it will scan"
+
+# --- Fleet targets (run over SSH; skipped with --local-only) -----------------
+fleet:
+  - name: example-fleet-users
+    machine: fleet-example
+    user: macadmin
+    path: /Users/macadmin
+    source_label: example-fleet-users
+    remote_output: /Users/macadmin/fleet-users.manifest.jsonl
+    agent_path: /Users/macadmin/manifest-agent.py
+    enabled: false
+    note: "Example only — a fleet machine needs its own copy of manifest-agent.py"

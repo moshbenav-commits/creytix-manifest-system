@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""
+Manifest Pipeline Orchestrator — MacCare manifest-pipeline.
+
+Keeps the manifest ledger (manifests.db) updated and clean across
+the local machine and, optionally, the fleet (remote over SSH).
+
+Rebuilt from the manifest-system pipeline.py as a commercial-clean,
+standard-library-only tool: NO PyYAML. Config is read by the strict
+YAML-subset parser in this file, or as JSON.
+
+Usage:
+  manifest-pipeline [--config CONFIG] [--local-only] [--db PATH] <command>
+
+  manifest-pipeline scan [target]     # run manifest-agent (with --resume) on target(s)
+  manifest-pipeline scan --all        # scan every enabled target
+  manifest-pipeline scan TARGET --foreground   # scan in the foreground (scripting)
+  manifest-pipeline collect           # scp fleet JSONLs -> incoming/
+  manifest-pipeline ingest [target]   # ingest collected manifests into DB
+  manifest-pipeline ingest --all      # ingest all known manifests
+  manifest-pipeline report            # ledger summary (read-only)
+  manifest-pipeline clean             # integrity check + vacuum (read-only-ish)
+  manifest-pipeline clean --prune <source> --confirm   # drop a stale source
+  manifest-pipeline full              # scan -> collect -> ingest -> report
+
+Idempotent: scan always uses --resume; ingest uses INSERT OR REPLACE;
+collect overwrites; all steps are safe to re-run.
+
+Options:
+  --config PATH   Config file (YAML subset or JSON). Default: pipeline-config.yaml
+                  next to this script, falling back to CONFIG_EXAMPLE.yaml.
+  --local-only    Skip every fleet target. Fleet steps (scan/collect of remote
+                  machines) are skipped gracefully; local work is unaffected.
+                  Fleet targets are also skipped gracefully when ssh/scp is
+                  not installed on this machine.
+  --db PATH       Use this SQLite file as the ledger instead of the one next
+                  to manifest-db.py. Intended for testing — it is how you
+                  verify the pipeline without touching a production ledger.
+
+Config format (see CONFIG_EXAMPLE.yaml):
+  settings: incoming_dir, agent_path, db_path, log_file, ssh_opts
+  local:    [{name, path, source_label, output, enabled}]
+  fleet:    [{name, machine, user, path, source_label, remote_output,
+              agent_path, enabled}]
+
+Relative paths in settings are resolved against the config file's directory.
+Source labels must stay stable: they are embedded in manifest entries and
+used as the DB's per-drive identity. Changing a label orphans the old rows.
+
+Original work by Ricardo Benavente — MIT License (see LICENSE).
+Python standard library only. No third-party dependencies.
+"""
+
+import argparse
+import json
+import logging
+import os
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CONFIG_NAMES = ("pipeline-config.yaml", "CONFIG_EXAMPLE.yaml")
+
+
+# --------------------------------------------------------------------------
+# Strict YAML-subset parser (stdlib-only; replaces PyYAML)
+# --------------------------------------------------------------------------
+# Supported: comments, nested mappings, lists of mappings, quoted
+# (single/double) and plain scalars, true/false/null, integers, floats.
+# NOT supported: anchors, aliases, multi-line scalars (|, >), flow
+# collections ({...}, [...]), tags, tabs for indentation. A config that
+# needs any of those must be supplied as JSON instead (see load_config).
+# --------------------------------------------------------------------------
+
+def _strip_comment(line):
+    """Remove a trailing '# ...' comment (only outside quotes)."""
+    out = []
+    in_single = in_double = False
+    for i, c in enumerate(line):
+        if c == "'" and not in_double:
+            in_single = not in_single
+            out.append(c)
+        elif c == '"' and not in_single:
+            if i == 0 or line[i - 1] != "\\":
+                in_double = not in_double
+            out.append(c)
+        elif c == "#" and not in_single and not in_double:
+            if i == 0 or line[i - 1] in " \t":
+                break
+            out.append(c)
+        else:
+            out.append(c)
+    return "".join(out).rstrip()
+
+
+def _parse_scalar(tok):
+    tok = tok.strip()
+    if tok == "":
+        return None
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("\"", "'"):
+        body = tok[1:-1]
+        if tok[0] == '"':
+            return (body.replace("\\\"", '"')
+                        .replace("\\\\", "\\")
+                        .replace("\\n", "\n")
+                        .replace("\\t", "\t"))
+        return body.replace("''", "'")
+    if tok == "true":
+        return True
+    if tok == "false":
+        return False
+    if tok in ("null", "~"):
+        return None
+    try:
+        return int(tok)
+    except ValueError:
+        pass
+    try:
+        return float(tok)
+    except ValueError:
+        pass
+    return tok
+
+
+def _split_key(line):
+    """Split 'key: value' on the first ':' outside quotes, else (None, None)."""
+    in_single = in_double = False
+    for i, c in enumerate(line):
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            if i == 0 or line[i - 1] != "\\":
+                in_double = not in_double
+        elif c == ":" and not in_single and not in_double:
+            if i + 1 == len(line) or line[i + 1] in " \t":
+                return line[:i].strip(), line[i + 1:].strip()
+    return None, None
+
+
+def _parse_block(lines, i, indent):
+    """Parse the block starting at lines[i] (indent >= given indent)."""
+    if i >= len(lines) or lines[i][0] < indent:
+        return None, i
+    text = lines[i][1]
+    if text.startswith("- ") or text == "-":
+        return _parse_list(lines, i, indent)
+    return _parse_map(lines, i, indent)
+
+
+def _parse_map(lines, i, indent):
+    out = {}
+    while i < len(lines):
+        ind, text = lines[i]
+        if ind < indent:
+            break
+        if ind > indent:
+            raise ValueError("bad indentation at line: %r" % text)
+        if text.startswith("- ") or text == "-":
+            break
+        key, val = _split_key(text)
+        if key is None:
+            raise ValueError("cannot parse mapping line: %r" % text)
+        i += 1
+        if val == "":
+            if i < len(lines) and lines[i][0] > indent:
+                val, i = _parse_block(lines, i, lines[i][0])
+            else:
+                val = None
+        else:
+            val = _parse_scalar(val)
+        out[key] = val
+    return out, i
+
+
+def _parse_list(lines, i, indent):
+    out = []
+    while i < len(lines):
+        ind, text = lines[i]
+        if ind < indent:
+            break
+        if ind > indent:
+            raise ValueError("bad indentation at line: %r" % text)
+        if not (text.startswith("- ") or text == "-"):
+            break
+        rest = text[2:].strip() if text.startswith("- ") else ""
+        i += 1
+        if rest == "":
+            if i < len(lines) and lines[i][0] > indent:
+                val, i = _parse_block(lines, i, lines[i][0])
+            else:
+                val = None
+            out.append(val)
+            continue
+        key, val = _split_key(rest)
+        if key is None:
+            out.append(_parse_scalar(rest))
+            continue
+        item = {}
+        if val == "":
+            if i < len(lines) and lines[i][0] > indent:
+                val, i = _parse_block(lines, i, lines[i][0])
+            else:
+                val = None
+        else:
+            val = _parse_scalar(val)
+        item[key] = val
+        # Continuation keys of this list item, at a deeper indent.
+        if i < len(lines) and lines[i][0] > indent:
+            cont, i = _parse_map(lines, i, lines[i][0])
+            item.update(cont)
+        out.append(item)
+    return out, i
+
+
+def parse_yaml_subset(text):
+    """Parse the supported YAML subset into plain Python data."""
+    lines = []
+    for raw in text.splitlines():
+        if "\t" in raw[:len(raw) - len(raw.lstrip())]:
+            raise ValueError("tabs are not supported for indentation: %r" % raw)
+        stripped = _strip_comment(raw)
+        if not stripped.strip():
+            continue
+        indent = len(stripped) - len(stripped.lstrip(" "))
+        lines.append((indent, stripped.strip()))
+    if not lines:
+        return {}
+    value, _ = _parse_block(lines, 0, lines[0][0])
+    return value if value is not None else {}
+
+
+def load_config(path):
+    """Load a config file: JSON if it looks like JSON, else YAML subset."""
+    with open(path) as f:
+        text = f.read()
+    if text.lstrip().startswith("{"):
+        cfg = json.loads(text)
+    else:
+        cfg = parse_yaml_subset(text)
+    if not isinstance(cfg, dict):
+        raise ValueError("config must be a mapping at the top level: %s" % path)
+    cfg.setdefault("settings", {})
+    return cfg
+
+
+def find_default_config():
+    for name in DEFAULT_CONFIG_NAMES:
+        candidate = os.path.join(HERE, name)
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.join(HERE, DEFAULT_CONFIG_NAMES[0])
+
+
+# --------------------------------------------------------------------------
+# Config helpers
+# --------------------------------------------------------------------------
+def resolve_settings(cfg, config_path):
+    """Fill defaults and resolve relative settings paths vs the config dir."""
+    settings = cfg.get("settings") or {}
+    config_dir = os.path.dirname(os.path.abspath(config_path))
+    defaults = {
+        "incoming_dir": os.path.join(HERE, "incoming"),
+        "agent_path": os.path.join(HERE, "manifest-agent.py"),
+        "db_path": os.path.join(HERE, "manifest-db.py"),
+        "log_file": os.path.join(HERE, "pipeline.log"),
+        "ssh_opts": "-o BatchMode=yes -o ConnectTimeout=15",
+    }
+    resolved = {}
+    for key, default in defaults.items():
+        value = settings.get(key) or default
+        if key in ("incoming_dir", "agent_path", "db_path", "log_file"):
+            if not os.path.isabs(value):
+                value = os.path.join(config_dir, value)
+        resolved[key] = value
+    return resolved
+
+
+def all_targets(cfg, local_only=False):
+    """Yield (kind, target_dict) for every enabled target."""
+    for t in cfg.get("local", []) or []:
+        if t.get("enabled", True):
+            yield ("local", t)
+    if local_only:
+        return
+    for t in cfg.get("fleet", []) or []:
+        if t.get("enabled", True):
+            yield ("fleet", t)
+
+
+def find_target(cfg, name, local_only=False):
+    for kind, t in all_targets(cfg, local_only=local_only):
+        if t["name"] == name:
+            return kind, t
+    return None, None
+
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+def setup_logging(log_file):
+    parent = os.path.dirname(os.path.abspath(log_file))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+
+
+# --------------------------------------------------------------------------
+# Shell helpers
+# --------------------------------------------------------------------------
+def run(cmd, **kw):
+    """Run a local command, log it, return CompletedProcess."""
+    logging.info("+ %s", cmd if isinstance(cmd, str) else shlex.join(cmd))
+    return subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                          text=True, **kw)
+
+
+def ssh_run(cfg, settings, machine, remote_cmd, timeout=60):
+    """Run a command on a fleet machine via SSH (None if ssh is absent)."""
+    if shutil.which("ssh") is None:
+        return None
+    opts = settings.get("ssh_opts", "")
+    cmd = "ssh %s %s %s" % (opts, shlex.quote(machine), shlex.quote(remote_cmd))
+    return run(cmd, timeout=timeout)
+
+
+def manifest_line_count(path):
+    """Count lines in a local manifest file (0 if missing)."""
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for _ in f)
+    except (IOError, OSError):
+        return 0
+
+
+def resolve_db_path(cfg, settings, args):
+    """Ledger location: --db wins, else the manifests.db next to db_path."""
+    if getattr(args, "db", None):
+        return os.path.abspath(args.db)
+    return os.path.join(
+        os.path.dirname(os.path.abspath(settings["db_path"])), "manifests.db")
+
+
+def db_env(args):
+    """Environment for manifest-db.py subprocesses (honours --db)."""
+    env = dict(os.environ)
+    if getattr(args, "db", None):
+        env["MANIFEST_DB_PATH"] = os.path.abspath(args.db)
+    return env
+
+
+# --------------------------------------------------------------------------
+# scan
+# --------------------------------------------------------------------------
+def cmd_scan(cfg, settings, args):
+    local_only = getattr(args, "local_only", False)
+    targets = []
+    if args.all:
+        targets = list(all_targets(cfg, local_only=local_only))
+    elif args.target:
+        kind, t = find_target(cfg, args.target, local_only=local_only)
+        if not t:
+            print("Unknown target: %s" % args.target, file=sys.stderr)
+            print("Known targets:", ", ".join(
+                t["name"] for _, t in all_targets(cfg, local_only=local_only)))
+            sys.exit(1)
+        targets = [(kind, t)]
+    else:
+        print("Specify a target or --all", file=sys.stderr)
+        sys.exit(1)
+
+    for kind, t in targets:
+        name = t["name"]
+        if kind == "local":
+            path = t.get("path")
+            if not path:
+                logging.warning("[%s] skipped: no path configured (pending drive?)", name)
+                continue
+            out = t["output"]
+            agent = settings["agent_path"]
+            if getattr(args, "foreground", False):
+                cmd = [sys.executable, agent, path,
+                       "--output", out,
+                       "--source", t["source_label"], "--resume"]
+                logging.info("+ %s", shlex.join(cmd))
+                r = subprocess.run(cmd)
+                if r.returncode == 0:
+                    logging.info("[%s] scan complete", name)
+                else:
+                    logging.error("[%s] scan failed (exit %d)", name, r.returncode)
+                continue
+            cmd = (
+                "nohup python3 %s %s "
+                "--output %s "
+                "--source %s --resume "
+                "> /tmp/manifest-%s.log 2>&1 & echo $!"
+                % (shlex.quote(agent), shlex.quote(path),
+                   shlex.quote(out), shlex.quote(t["source_label"]), name)
+            )
+            r = run(cmd)
+            if r.returncode == 0:
+                logging.info("[%s] scan started (PID %s), log /tmp/manifest-%s.log",
+                             name, r.stdout.strip(), name)
+            else:
+                logging.error("[%s] failed to start: %s", name, r.stderr.strip())
+        else:
+            if shutil.which("ssh") is None:
+                logging.warning("[%s] skipped: ssh is not installed; "
+                                "fleet scan needs ssh (use --local-only to "
+                                "silence this)", name)
+                continue
+            machine, user = t["machine"], t["user"]
+            agent = t.get("agent_path") or "/Users/%s/manifest-agent.py" % user
+            remote_cmd = (
+                "test -f %s && "
+                "nohup python3 %s %s "
+                "--output %s "
+                "--source %s --resume "
+                "> /tmp/manifest-%s.log 2>&1 & echo $! "
+                "|| echo AGENT_MISSING"
+                % (shlex.quote(agent), shlex.quote(agent),
+                   shlex.quote(t["path"]), shlex.quote(t["remote_output"]),
+                   shlex.quote(t["source_label"]), name)
+            )
+            r = ssh_run(cfg, settings, machine, remote_cmd)
+            if r is None:
+                logging.warning("[%s] skipped: ssh is not installed", name)
+                continue
+            out = r.stdout.strip()
+            if "AGENT_MISSING" in out:
+                logging.error("[%s] manifest-agent.py not found at %s on %s",
+                              name, agent, machine)
+            elif r.returncode == 0:
+                logging.info("[%s] scan started on %s (PID %s)", name, machine, out)
+            else:
+                logging.error("[%s] ssh failed: %s", name, r.stderr.strip() or out)
+
+
+# --------------------------------------------------------------------------
+# collect
+# --------------------------------------------------------------------------
+def cmd_collect(cfg, settings, args):
+    if getattr(args, "local_only", False):
+        logging.info("local-only: skipping fleet collect (no fleet targets)")
+        return []
+    if shutil.which("scp") is None:
+        logging.warning("scp is not installed; cannot collect fleet manifests. "
+                        "Skipping collect gracefully (use --local-only).")
+        return []
+    incoming = settings["incoming_dir"]
+    os.makedirs(incoming, exist_ok=True)
+    opts = settings.get("ssh_opts", "")
+
+    collected = []
+    fleet_total = 0
+    for kind, t in all_targets(cfg):
+        if kind != "fleet":
+            continue
+        fleet_total += 1
+        name = t["name"]
+        machine, user = t["machine"], t["user"]
+        src = "%s@%s:%s" % (user, machine, t["remote_output"])
+        dst = os.path.join(incoming, "%s.manifest.jsonl" % name)
+        cmd = "scp %s %s %s" % (opts, shlex.quote(src), shlex.quote(dst))
+        r = run(cmd, timeout=600)
+        if r.returncode == 0 and os.path.exists(dst):
+            n = manifest_line_count(dst)
+            logging.info("[%s] collected %s (%d lines)", name, dst, n)
+            collected.append((name, dst, n))
+        else:
+            logging.error("[%s] collect failed: %s", name, r.stderr.strip()[:200])
+    logging.info("Collected %d/%d fleet manifests", len(collected), fleet_total)
+    return collected
+
+
+# --------------------------------------------------------------------------
+# ingest
+# --------------------------------------------------------------------------
+def known_manifest_files(cfg, settings, local_only=False):
+    """Map target name -> local manifest path (local outputs + incoming/)."""
+    incoming = settings["incoming_dir"]
+    files = {}
+    for kind, t in all_targets(cfg, local_only=local_only):
+        if kind == "local":
+            files[t["name"]] = t["output"]
+        else:
+            files[t["name"]] = os.path.join(incoming, "%s.manifest.jsonl" % t["name"])
+    return files
+
+
+def cmd_ingest(cfg, settings, args):
+    local_only = getattr(args, "local_only", False)
+    db_tool = settings["db_path"]
+    files = known_manifest_files(cfg, settings, local_only=local_only)
+
+    if args.all:
+        names = list(files.keys())
+    elif args.target:
+        if args.target not in files:
+            print("Unknown target: %s" % args.target, file=sys.stderr)
+            sys.exit(1)
+        names = [args.target]
+    else:
+        print("Specify a target or --all", file=sys.stderr)
+        sys.exit(1)
+
+    for name in names:
+        path = files[name]
+        if not os.path.exists(path):
+            logging.warning("[%s] no manifest at %s, skipping", name, path)
+            continue
+        n = manifest_line_count(path)
+        logging.info("[%s] ingesting %s (%d lines)...", name, path, n)
+        r = run([sys.executable, db_tool, "ingest", path],
+                timeout=7200, env=db_env(args))
+        if r.returncode == 0:
+            logging.info("[%s] %s", name, r.stdout.strip() or r.stderr.strip())
+        else:
+            logging.error("[%s] ingest failed: %s", name, r.stderr.strip()[:500])
+
+
+# --------------------------------------------------------------------------
+# report (read-only)
+# --------------------------------------------------------------------------
+def cmd_report(cfg, settings, args):
+    dbp = resolve_db_path(cfg, settings, args)
+    if not os.path.exists(dbp):
+        print("Database not found: %s" % dbp, file=sys.stderr)
+        sys.exit(1)
+
+    conn = sqlite3.connect("file:%s?mode=ro" % dbp, uri=True)
+    conn.row_factory = sqlite3.Row
+
+    total = conn.execute("SELECT COUNT(*), COALESCE(SUM(size),0) FROM files").fetchone()
+    no_hash = conn.execute("SELECT COUNT(*) FROM files WHERE sha256 IS NULL").fetchone()[0]
+
+    print("=" * 60)
+    print("MANIFEST LEDGER SUMMARY")
+    print("=" * 60)
+    print("Generated: %s" % datetime.now().isoformat(timespec="seconds"))
+    print("Database:  %s" % dbp)
+    print()
+    print("Total files: %s" % format(total[0], ","))
+    print("Total size:  %s bytes (%.2f TB)" % (format(total[1], ","), total[1] / 1e12))
+    print("Files without hash: %s" % format(no_hash, ","))
+
+    print("\nBy source:")
+    for s in conn.execute(
+            "SELECT source, COUNT(*) c, COALESCE(SUM(size),0) sz "
+            "FROM files GROUP BY source ORDER BY sz DESC"):
+        print("  %s: %s files, %.1f GB" % (s["source"], format(s["c"], ","), s["sz"] / 1e9))
+
+    print("\nBy type:")
+    for t in conn.execute(
+            "SELECT type, COUNT(*) c, COALESCE(SUM(size),0) sz "
+            "FROM files GROUP BY type ORDER BY sz DESC"):
+        print("  %s: %s files, %.1f GB" % (t["type"] or "unknown", format(t["c"], ","), t["sz"] / 1e9))
+
+    # Duplicate aggregates (no per-file listing — fast on 9M+ rows)
+    dup = conn.execute("""
+        SELECT COUNT(*) groups, COALESCE(SUM((n-1)*sz),0) reclaim
+        FROM (SELECT sha256, COUNT(*) n, MAX(size) sz
+              FROM files WHERE sha256 IS NOT NULL
+              GROUP BY sha256 HAVING n > 1)
+    """).fetchone()
+    print("\nDuplicate groups: %s" % format(dup["groups"], ","))
+    print("Reclaimable: %s bytes (%.1f GB)" % (format(dup["reclaim"], ","), dup["reclaim"] / 1e9))
+
+    print("\nTop 10 duplicate groups by wasted space:")
+    for d in conn.execute("""
+        SELECT n, sz, (n-1)*sz wasted
+        FROM (SELECT sha256, COUNT(*) n, MAX(size) sz
+              FROM files WHERE sha256 IS NOT NULL
+              GROUP BY sha256 HAVING n > 1)
+        ORDER BY wasted DESC LIMIT 10
+    """):
+        print("  %sx copies of %s bytes -> wastes %s bytes"
+              % (d["n"], format(d["sz"], ","), format(d["wasted"], ",")))
+
+    # Configured vs. present sources
+    configured = {t["source_label"] for _, t in all_targets(cfg, local_only=getattr(args, "local_only", False))}
+    present = {r[0] for r in conn.execute("SELECT DISTINCT source FROM files")}
+    stale = sorted(present - configured)
+    missing = sorted(configured - present)
+    if stale:
+        print("\nStale sources in DB (not in config): %s" % ", ".join(stale))
+    if missing:
+        print("Configured sources with no rows yet: %s" % ", ".join(missing))
+
+    conn.close()
+    logging.info("report complete")
+
+
+# --------------------------------------------------------------------------
+# clean
+# --------------------------------------------------------------------------
+def cmd_clean(cfg, settings, args):
+    dbp = resolve_db_path(cfg, settings, args)
+    if not os.path.exists(dbp):
+        print("Database not found: %s" % dbp, file=sys.stderr)
+        sys.exit(1)
+
+    conn = sqlite3.connect(dbp)
+    integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    print("integrity_check: %s" % integ)
+    logging.info("integrity_check: %s", integ)
+    if integ != "ok":
+        print("Database integrity FAILED — not proceeding.", file=sys.stderr)
+        conn.close()
+        sys.exit(1)
+
+    configured = {t["source_label"] for _, t in all_targets(cfg, local_only=getattr(args, "local_only", False))}
+    present = [r[0] for r in conn.execute("SELECT DISTINCT source FROM files")]
+    stale = sorted(set(present) - configured)
+    if stale:
+        print("Stale sources (in DB, not in config): %s" % ", ".join(stale))
+    else:
+        print("No stale sources.")
+
+    if args.prune:
+        if args.prune not in present:
+            print("Source '%s' not in DB." % args.prune, file=sys.stderr)
+            conn.close()
+            sys.exit(1)
+        if not args.confirm:
+            print("Refusing to prune '%s' without --confirm." % args.prune, file=sys.stderr)
+            conn.close()
+            sys.exit(1)
+        n = conn.execute("SELECT COUNT(*) FROM files WHERE source=?", (args.prune,)).fetchone()[0]
+        conn.execute("DELETE FROM files WHERE source=?", (args.prune,))
+        conn.commit()
+        logging.warning("pruned source '%s' (%d rows)", args.prune, n)
+        print("Pruned '%s': %s rows deleted." % (args.prune, format(n, ",")))
+
+    conn.execute("VACUUM")
+    conn.close()
+    print("VACUUM complete.")
+    logging.info("clean complete")
+
+
+# --------------------------------------------------------------------------
+# full
+# --------------------------------------------------------------------------
+def cmd_full(cfg, settings, args):
+    logging.info("=== PIPELINE FULL RUN START ===")
+    args_all = argparse.Namespace(all=True, target=None,
+                                  local_only=getattr(args, "local_only", False),
+                                  db=getattr(args, "db", None),
+                                  foreground=False)
+    cmd_scan(cfg, settings, args_all)
+    logging.info("--- scan launched (background); collecting current manifests ---")
+    cmd_collect(cfg, settings, args)
+    cmd_ingest(cfg, settings, args_all)
+    cmd_report(cfg, settings, args)
+    logging.info("=== PIPELINE FULL RUN COMPLETE ===")
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(
+        description="Manifest pipeline orchestrator (MacCare, stdlib-only)")
+    ap.add_argument("--config", default=None,
+                    help="Config file (YAML subset or JSON). Default: "
+                         "pipeline-config.yaml next to this script, else "
+                         "CONFIG_EXAMPLE.yaml.")
+    ap.add_argument("--local-only", action="store_true",
+                    help="Skip all fleet targets; local work only.")
+    ap.add_argument("--db", default=None, metavar="PATH",
+                    help="Ledger SQLite file to use instead of the default "
+                         "(testing; never points at a production ledger "
+                         "unless you mean it).")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("scan", help="Run manifest-agent on target(s) with --resume")
+    p.add_argument("target", nargs="?", help="Target name from config")
+    p.add_argument("--all", action="store_true", help="Scan all enabled targets")
+    p.add_argument("--foreground", action="store_true",
+                   help="Run the agent in the foreground and wait for it "
+                        "(local targets; useful for scripting and tests)")
+
+    sub.add_parser("collect", help="SCP fleet JSONLs to incoming/ (skipped with --local-only)")
+
+    p = sub.add_parser("ingest", help="Ingest manifests into manifests.db")
+    p.add_argument("target", nargs="?", help="Target name from config")
+    p.add_argument("--all", action="store_true", help="Ingest all known manifests")
+
+    sub.add_parser("report", help="Ledger summary (read-only)")
+
+    p = sub.add_parser("clean", help="Integrity check, stale-source report, vacuum")
+    p.add_argument("--prune", metavar="SOURCE", help="Delete all rows for a source label")
+    p.add_argument("--confirm", action="store_true", help="Required to actually prune")
+
+    sub.add_parser("full", help="scan -> collect -> ingest -> report")
+
+    args = ap.parse_args()
+
+    config_path = args.config or find_default_config()
+    if not os.path.exists(config_path):
+        print("Config not found: %s" % config_path, file=sys.stderr)
+        print("Copy CONFIG_EXAMPLE.yaml to pipeline-config.yaml and edit it, "
+              "or pass --config.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        cfg = load_config(config_path)
+    except (ValueError, json.JSONDecodeError, IOError, OSError) as e:
+        print("Failed to load config %s: %s" % (config_path, e), file=sys.stderr)
+        sys.exit(1)
+    settings = resolve_settings(cfg, config_path)
+    setup_logging(settings["log_file"])
+
+    logging.info("pipeline %s invoked (config %s)", args.command, config_path)
+    if getattr(args, "db", None):
+        logging.info("using ledger override: %s", os.path.abspath(args.db))
+    if getattr(args, "local_only", False):
+        logging.info("local-only mode: fleet targets skipped")
+    if args.command == "scan":
+        cmd_scan(cfg, settings, args)
+    elif args.command == "collect":
+        cmd_collect(cfg, settings, args)
+    elif args.command == "ingest":
+        cmd_ingest(cfg, settings, args)
+    elif args.command == "report":
+        cmd_report(cfg, settings, args)
+    elif args.command == "clean":
+        cmd_clean(cfg, settings, args)
+    elif args.command == "full":
+        cmd_full(cfg, settings, args)
+
+
+if __name__ == "__main__":
+    main()
